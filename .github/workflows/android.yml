@@ -1,0 +1,71 @@
+name: Build Android
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Write app keys
+        run: |
+          {
+            echo "EXPO_PUBLIC_SUPABASE_URL=${{ secrets.EXPO_PUBLIC_SUPABASE_URL }}"
+            echo "EXPO_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.EXPO_PUBLIC_SUPABASE_ANON_KEY }}"
+            echo "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY=${{ secrets.EXPO_PUBLIC_REVENUECAT_ANDROID_KEY }}"
+            echo "EXPO_PUBLIC_REVENUECAT_IOS_KEY=${{ secrets.EXPO_PUBLIC_REVENUECAT_IOS_KEY }}"
+          } > .env
+
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Build release APK and AAB
+        working-directory: android
+        run: ./gradlew assembleRelease bundleRelease --no-daemon
+
+      - name: Sign with your upload key
+        if: ${{ env.KEYSTORE != '' }}
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE" | base64 -d > upload.keystore
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          AAB=android/app/build/outputs/bundle/release/app-release.aab
+          $BT/zipalign -f -p 4 $APK aligned.apk
+          $BT/apksigner sign --ks upload.keystore --ks-pass env:KS_PASS --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASS --out $APK aligned.apk
+          zip -d $AAB 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.EC' 'META-INF/*.MF' || true
+          jarsigner -keystore upload.keystore -storepass "$KS_PASS" -keypass "$KEY_PASS" -sigalg SHA256withRSA -digestalg SHA-256 $AAB "$KEY_ALIAS"
+          rm upload.keystore aligned.apk
+
+      - name: Collect files
+        run: |
+          mkdir out
+          cp android/app/build/outputs/apk/release/app-release.apk out/MoodCircle.apk
+          cp android/app/build/outputs/bundle/release/app-release.aab out/MoodCircle-playstore.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moodcircle-android
+          path: out/
